@@ -30,7 +30,7 @@ begin
 
   # get API usage
   usage_client = SelectPdf::UsageClient.new(api_key)
-  usage = usage_client.get_usage(FALSE)
+  usage = usage_client.get_usage(false)
   print("Usage: #{usage}\n")
   print('Conversions remained this month: ', usage['available'], "\n")
 rescue SelectPdf::ApiException => e

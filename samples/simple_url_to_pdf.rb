@@ -10,8 +10,8 @@ begin
 
   api.page_size = SelectPdf::PageSize::A4
   api.margins = 0
-  api.page_numbers = FALSE
-  api.page_breaks_enhanced_algorithm = TRUE
+  api.page_numbers = false
+  api.page_breaks_enhanced_algorithm = true
 
   api.convert_url_to_file(url, local_file)
 rescue SelectPdf::ApiException => e

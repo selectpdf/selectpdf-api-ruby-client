@@ -14,22 +14,22 @@ begin
   # set parameters - see full list at https://selectpdf.com/html-to-pdf-api/
 
   client.margins = 0 # PDF page margins
-  client.page_breaks_enhanced_algorithm = TRUE # enhanced page break algorithm
+  client.page_breaks_enhanced_algorithm = true # enhanced page break algorithm
 
   # header properties
-  client.show_header = TRUE # display header
+  client.show_header = true # display header
   # client.header_height = 50 # header height
   # client.header_url = url # header url
   client.header_html = 'This is the <b>HEADER</b>!!!!' # header html
 
   # footer properties
-  client.show_footer = TRUE # display footer
+  client.show_footer = true # display footer
   # client.footer_height = 60 # footer height
   # client.footer_url = url # footer url
   client.footer_html = 'This is the <b>FOOTER</b>!!!!' # footer html
 
   # footer page numbers
-  client.page_numbers = TRUE # show page numbers in footer
+  client.page_numbers = true # show page numbers in footer
   client.page_numbers_template = '{page_number} / {total_pages}' # page numbers template
   client.page_numbers_font_name = 'Verdanda' # page numbers font name
   client.page_numbers_font_size = 12 # page numbers font size
@@ -53,7 +53,7 @@ begin
 
   # get API usage
   usage_client = SelectPdf::UsageClient.new(api_key)
-  usage = usage_client.get_usage(FALSE)
+  usage = usage_client.get_usage(false)
   print("Usage: #{usage}\n")
   print('Conversions remained this month: ', usage['available'], "\n")
 rescue SelectPdf::ApiException => e

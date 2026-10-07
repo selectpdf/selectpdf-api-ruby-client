@@ -22,8 +22,8 @@ require 'fileutils'
 #
 #    api.page_size = SelectPdf::PageSize::A4
 #    api.margins = 0
-#    api.page_numbers = FALSE
-#    api.page_breaks_enhanced_algorithm = TRUE
+#    api.page_numbers = false
+#    api.page_breaks_enhanced_algorithm = true
 #
 #    api.convert_url_to_file(url, local_file)
 #  rescue SelectPdf::ApiException => e
@@ -66,7 +66,7 @@ require 'fileutils'
 #  
 #    # get API usage
 #    usage_client = SelectPdf::UsageClient.new(api_key)
-#    usage = usage_client.get_usage(FALSE)
+#    usage = usage_client.get_usage(false)
 #    print("Usage: #{usage}\n")
 #    print('Conversions remained this month: ', usage['available'], "\n")
 #  rescue SelectPdf::ApiException => e
@@ -114,7 +114,7 @@ require 'fileutils'
 #
 #    # get API usage
 #    usage_client = SelectPdf::UsageClient.new(api_key)
-#    usage = usage_client.get_usage(FALSE)
+#    usage = usage_client.get_usage(false)
 #    print("Usage: #{usage}\n")
 #    print('Conversions remained this month: ', usage['available'], "\n")
 #  rescue SelectPdf::ApiException => e
@@ -155,7 +155,7 @@ require 'fileutils'
 #    
 #      # get API usage
 #      usage_client = SelectPdf::UsageClient.new(api_key)
-#      usage = usage_client.get_usage(FALSE)
+#      usage = usage_client.get_usage(false)
 #      print("Usage: #{usage}\n")
 #      print('Conversions remained this month: ', usage['available'], "\n")
 #    rescue SelectPdf::ApiException => e
@@ -170,7 +170,10 @@ module SelectPdf
   NEW_LINE = "\r\n"
 
   # Library version
-  CLIENT_VERSION = '1.4.0'
+  CLIENT_VERSION = '1.6.0'
+
+  # Default upgrade URL displayed in demo-mode error messages.
+  DEMO_UPGRADE_URL = 'https://selectpdf.com/pricing/'
 
   attr_reader :code, :message
   #
@@ -187,6 +190,115 @@ module SelectPdf
     # Get complete error message
     def to_s
       @code ? "(#{@code}) #{@message}" : @message
+    end
+  end
+
+  # Exception raised when the keyless demo endpoint refuses a request because of a rate limit (HTTP 429 or 503).
+  # Inspect reason to distinguish:
+  # * per_ip - the source IP exceeded its hourly conversion budget
+  # * concurrency - too many demo conversions are running right now
+  # * daily_cap - the global demo budget for today has been reached
+  class DemoRateLimitException < ApiException
+    # HTTP status code returned by the server (429 or 503).
+    attr_reader :status_code
+
+    # Machine-readable rate-limit reason: per_ip, concurrency or daily_cap.
+    attr_reader :reason
+
+    # Seconds the client should wait before retrying (parsed from the Retry-After header). Zero if absent.
+    attr_reader :retry_after
+
+    # URL the user can visit to upgrade out of demo mode.
+    attr_reader :upgrade_url
+
+    # The raw JSON body the server returned, for diagnostics / logging.
+    attr_reader :response_body
+
+    # Constructor invoked by the client when the demo endpoint returns a rate-limit error.
+    #
+    # @param status_code HTTP status code.
+    # @param reason Rate-limit reason.
+    # @param retry_after Seconds to wait before retrying.
+    # @param upgrade_url Upgrade URL.
+    # @param response_body Raw JSON body.
+    def initialize(status_code, reason, retry_after, upgrade_url, response_body)
+      upgrade = upgrade_url.nil? || upgrade_url.empty? ? DEMO_UPGRADE_URL : upgrade_url
+      retry_after = retry_after.to_i
+      retry_text = retry_after > 0 ? " Retry after #{retry_after}s." : ''
+      super("(#{status_code}) Demo rate limit reached (reason=#{reason || '?'}).#{retry_text} Upgrade at #{upgrade}.")
+
+      @status_code = status_code
+      @reason = reason || ''
+      @retry_after = retry_after
+      @upgrade_url = upgrade
+      @response_body = response_body
+    end
+  end
+
+  # Exception raised when the demo safety guard rejects a request because a URL field references a non-public host (HTTP 400).
+  # Inspect field for which parameter was rejected and reason for why.
+  class DemoSafetyException < ApiException
+    # HTTP status code returned by the server (400).
+    attr_reader :status_code
+
+    # Which input field was rejected: url, html, base_url, header_url, footer_url.
+    attr_reader :field
+
+    # Why the field was rejected: blocked_host, private_ip, loopback, link_local, cgnat, metadata, multicast, bad_scheme, bad_url, inline_internal_ref:<sub-reason>.
+    attr_reader :reason
+
+    # The raw JSON body the server returned, for diagnostics / logging.
+    attr_reader :response_body
+
+    # Constructor invoked by the client when the demo safety guard rejects a URL field.
+    #
+    # @param status_code HTTP status code.
+    # @param field Rejected field.
+    # @param reason Rejection reason.
+    # @param response_body Raw JSON body.
+    def initialize(status_code, field, reason, response_body)
+      super("(#{status_code}) Demo safety guard rejected #{field || '?'} (reason=#{reason || '?'}). Demo conversions cannot fetch internal/private hosts.")
+
+      @status_code = status_code
+      @field = field || ''
+      @reason = reason || ''
+      @response_body = response_body
+    end
+  end
+
+  # Exception raised when the caller tried to use a feature that demo mode does not support - most commonly PDF passwords.
+  # For paid keys, this exception is never raised.
+  class DemoUnsupportedException < ApiException
+    # HTTP status code returned by the server (400). Zero if the exception was raised by the local client guard before the request was sent.
+    attr_reader :status_code
+
+    # Which feature is unsupported: user_password, owner_password, async.
+    attr_reader :field
+
+    # URL the user can visit to upgrade out of demo mode.
+    attr_reader :upgrade_url
+
+    # The raw JSON body the server returned, for diagnostics / logging. Nil when raised by the local client guard.
+    attr_reader :response_body
+
+    # Constructor. Pass status_code 0 (and no body) for the local client-side guard that runs before the request is sent.
+    #
+    # @param status_code HTTP status code (0 for the local client guard).
+    # @param field Unsupported feature.
+    # @param upgrade_url Upgrade URL.
+    # @param response_body Raw JSON body.
+    def initialize(status_code, field, upgrade_url = nil, response_body = nil)
+      upgrade = upgrade_url.nil? || upgrade_url.empty? ? DEMO_UPGRADE_URL : upgrade_url
+      if status_code.to_i == 0
+        super("Feature '#{field || '?'}' is not available in demo mode. Construct HtmlToPdfClient with a paid API key, or upgrade at #{DEMO_UPGRADE_URL}.")
+      else
+        super("(#{status_code}) Feature '#{field || '?'}' is not available in demo mode. Upgrade at #{upgrade}.")
+      end
+
+      @status_code = status_code.to_i
+      @field = field || ''
+      @upgrade_url = upgrade
+      @response_body = response_body
     end
   end
 
@@ -225,6 +337,22 @@ module SelectPdf
     # Number of pages of the pdf document resulted from the conversion.
     attr_reader :number_of_pages
 
+    # Subscription monthly conversion limit reported by the server (X-SelectPdf-Credits-Total response header).
+    # -1 = unlimited (Dedicated tier). Nil = the most recent response did not include credit info (e.g. demo endpoint, error response).
+    attr_reader :credits_total
+
+    # Conversions remaining in the current month reported by the server (X-SelectPdf-Credits-Remaining response header).
+    # -1 = unlimited (Dedicated tier). Nil = the most recent response did not include credit info.
+    attr_reader :credits_remaining
+
+    # Endpoint mode of the most recent response (X-SelectPdf-Mode response header): "production" or "demo".
+    # Empty when the response did not include the header (older server, or non-conversion endpoint).
+    attr_reader :mode
+
+    # Server-side execution path of the most recent response (X-SelectPdf-Execution response header): "in-process" or "worker".
+    # Empty for endpoints that do not perform a conversion (e.g. usage, web elements).
+    attr_reader :execution_mode
+
     # Class constructor
     def initialize
       # API endpoint
@@ -254,6 +382,15 @@ module SelectPdf
       # Job ID for asynchronous calls or for calls that require a second request.
       @job_id = ''
 
+      # Last HTTP status code.
+      @last_http_code = 0
+
+      # Response telemetry.
+      @credits_total = nil
+      @credits_remaining = nil
+      @mode = ''
+      @execution_mode = ''
+
       # Ping interval in seconds for asynchronous calls. Default value is 3 seconds.
       @async_calls_ping_interval = 3
 
@@ -266,60 +403,12 @@ module SelectPdf
     # @param out_stream Output response to this stream, if specified.
     # @return If output stream is not specified, return response.
     def perform_post(out_stream = nil)
-      # reset results
-      @number_of_pages = 0
-      @job_id = ''
+      uri = URI(@api_endpoint)
+      request = Net::HTTP::Post.new uri.request_uri
+      request.set_form_data(@parameters)
+      request['Content-Type'] = 'application/x-www-form-urlencoded'
 
-      uri = URI(api_endpoint)
-      http = Net::HTTP.new(uri.host, uri.port)
-      http.use_ssl = @api_endpoint.downcase.start_with?('https')
-      http.read_timeout = 600 # timeout in seconds 600s=10minutes
-
-      http.start do |connection|
-        request = Net::HTTP::Post.new uri.request_uri
-        request.set_form_data(@parameters)
-
-        # add headers
-        request['selectpdf-api-client'] = "ruby-#{RUBY_VERSION}-#{CLIENT_VERSION}"
-        request['Content-Type'] = 'application/x-www-form-urlencoded'
-        @headers.each do |key, value|
-          request[key] = value
-        end
-
-        connection.request request do |response|
-          case response
-          when Net::HTTPSuccess
-            # all ok
-            @number_of_pages = (response['selectpdf-api-pages'] || 0).to_i
-            @job_id = response['selectpdf-api-jobid']
-
-            return response.body unless out_stream # return response if out_stream is not provided
-
-            # out_steam is provided - write to it
-            response.read_body do |chunk|
-              out_stream.write chunk
-            end
-          when Net::HTTPAccepted
-            # request accepted (for asynchronous jobs)
-            @job_id = response['selectpdf-api-jobid']
-
-            return nil
-          else
-            # error - get error message
-            raise ApiException.new(response.body, response.code), response.body
-          end
-        end
-      end
-    rescue ApiException
-      raise
-    rescue SocketError => e
-      raise ApiException.new("Socket Error: #{e}"), "Socket Error: #{e}"
-    rescue Timeout::Error
-      raise ApiException.new("Connection Timeout: #{http.read_timeout}s exceeded"), "Connection Timeout: #{http.read_timeout}s exceeded"
-    rescue OpenSSL::SSL::SSLError => e
-      raise ApiException.new("SSL Error: #{e}"), "SSL Error: #{e}"
-    rescue StandardError => e
-      raise ApiException.new("Connection refused: #{e}"), "Connection refused: #{e}"
+      execute_request(uri, request, out_stream)
     end
     protected :perform_post
 
@@ -328,34 +417,48 @@ module SelectPdf
     # @param out_stream Output response to this stream, if specified.
     # @return If output stream is not specified, return response.
     def perform_post_as_multipart_formdata(out_stream = nil)
-      # reset results
-      @number_of_pages = 0
-      @job_id = ''
+      uri = URI(@api_endpoint)
+      request = Net::HTTP::Post.new uri.request_uri
+      request.body = encode_multipart_form_data
+      request['Content-Type'] = "multipart/form-data; boundary=#{MULTIPART_FORM_DATA_BOUNDARY}"
+      request['Content-Length'] = request.body.bytesize.to_s
 
-      uri = URI(api_endpoint)
+      execute_request(uri, request, out_stream)
+    end
+    protected :perform_post_as_multipart_formdata
+
+    # Send a prepared request and process the response.
+    #
+    # @param uri Endpoint URI.
+    # @param request Prepared POST request.
+    # @param out_stream Output response to this stream, if specified.
+    # @return If output stream is not specified, return response.
+    def execute_request(uri, request, out_stream)
+      # reset results
+      reset_results
+
+      # add headers
+      request['selectpdf-api-client'] = "ruby-#{RUBY_VERSION}-#{CLIENT_VERSION}"
+      @headers.each do |key, value|
+        request[key] = value
+      end
+
       http = Net::HTTP.new(uri.host, uri.port)
       http.use_ssl = @api_endpoint.downcase.start_with?('https')
       http.read_timeout = 600 # timeout in seconds 600s=10minutes
 
       http.start do |connection|
-        request = Net::HTTP::Post.new uri.request_uri
-        request.body = encode_multipart_form_data
-
-        # add headers
-        request['selectpdf-api-client'] = "ruby-#{RUBY_VERSION}-#{CLIENT_VERSION}"
-        request['Content-Type'] = "multipart/form-data; boundary=#{MULTIPART_FORM_DATA_BOUNDARY}"
-        request['Content-Length'] = request.body.length
-
-        @headers.each do |key, value|
-          request[key] = value
-        end
-
         connection.request request do |response|
-          case response
-          when Net::HTTPSuccess
+          @last_http_code = response.code.to_i
+
+          if response.is_a?(Net::HTTPAccepted)
+            # request accepted (for asynchronous jobs)
+            read_response_headers(response)
+
+            return nil
+          elsif response.is_a?(Net::HTTPSuccess)
             # all ok
-            @number_of_pages = (response['selectpdf-api-pages'] || 0).to_i
-            @job_id = response['selectpdf-api-jobid']
+            read_response_headers(response)
 
             return response.body unless out_stream # return response if out_stream is not provided
 
@@ -363,14 +466,20 @@ module SelectPdf
             response.read_body do |chunk|
               out_stream.write chunk
             end
-          when Net::HTTPAccepted
-            # request accepted (for asynchronous jobs)
-            @job_id = response['selectpdf-api-jobid']
 
             return nil
           else
             # error - get error message
-            raise ApiException.new(response.body, response.code), response.body
+            body = response.body.to_s.dup.force_encoding('UTF-8')
+
+            # The demo endpoint returns JSON error bodies for 400 / 413 / 429 / 503.
+            # Parse those into typed exceptions so callers can react programmatically.
+            if response['Content-Type'].to_s.downcase.include?('application/json')
+              demo_exception = build_demo_exception(response.code.to_i, body, response['Retry-After'])
+              raise demo_exception unless demo_exception.nil?
+            end
+
+            raise ApiException.new(body, response.code), body
           end
         end
       end
@@ -379,48 +488,167 @@ module SelectPdf
     rescue SocketError => e
       raise ApiException.new("Socket Error: #{e}"), "Socket Error: #{e}"
     rescue Timeout::Error
-      raise ApiException.new("Connection Timeout: #{http.read_timeout}s exceeded"), "Connection Timeout: #{http.read_timeout}s exceeded"
+      raise ApiException.new('Connection Timeout: 600s exceeded'), 'Connection Timeout: 600s exceeded'
     rescue OpenSSL::SSL::SSLError => e
       raise ApiException.new("SSL Error: #{e}"), "SSL Error: #{e}"
     rescue StandardError => e
       raise ApiException.new("Connection refused: #{e}"), "Connection refused: #{e}"
     end
-    protected :perform_post_as_multipart_formdata
+    private :execute_request
+
+    # Reset the results of the previous call.
+    def reset_results
+      @number_of_pages = 0
+      @job_id = ''
+      @last_http_code = 0
+      @credits_total = nil
+      @credits_remaining = nil
+      @mode = ''
+      @execution_mode = ''
+    end
+    private :reset_results
+
+    # Read the standard X-SelectPdf-* response headers.
+    #
+    # @param response HTTP response.
+    def read_response_headers(response)
+      pages = response['X-SelectPdf-Pages']
+      @number_of_pages = pages.to_i unless pages.nil? || pages.empty?
+
+      job_id = response['X-SelectPdf-Job-Id']
+      @job_id = job_id unless job_id.nil? || job_id.empty?
+
+      @credits_total = parse_int_header(response['X-SelectPdf-Credits-Total'])
+      @credits_remaining = parse_int_header(response['X-SelectPdf-Credits-Remaining'])
+
+      mode = response['X-SelectPdf-Mode']
+      @mode = mode unless mode.nil? || mode.empty?
+
+      execution_mode = response['X-SelectPdf-Execution']
+      @execution_mode = execution_mode unless execution_mode.nil? || execution_mode.empty?
+
+      begin
+        on_response_headers_received(response)
+      rescue StandardError
+        # ignore errors in subclass header processing
+        nil
+      end
+    end
+    private :read_response_headers
+
+    # Hook called after a successful response, with the raw response.
+    # Subclasses can override it to capture endpoint-specific headers. Default implementation does nothing.
+    #
+    # @param response HTTP response.
+    def on_response_headers_received(response); end
+    protected :on_response_headers_received
+
+    # Parse an integer header value.
+    #
+    # @param value Header value.
+    # @return Integer value or nil if the value is missing or not an integer.
+    def parse_int_header(value)
+      return nil if value.nil?
+
+      value = value.strip
+      return nil unless value =~ /\A[-+]?\d+\z/
+
+      value.to_i
+    end
+    private :parse_int_header
+
+    # Build a typed demo exception from a JSON error body returned by the demo endpoint.
+    #
+    # The demo endpoint returns structured JSON for 400 / 413 / 429 / 503 errors:
+    #   {"error":"rate_limited","reason":"per_ip","upgrade":"..."}
+    #   {"error":"unsafe_url","field":"url","reason":"private_ip"}
+    #   {"error":"unsupported_in_demo","field":"user_password","upgrade":"..."}
+    #   {"error":"body_too_large","max_bytes":1048576,"upgrade":"..."}
+    #
+    # @param status_code HTTP status code.
+    # @param body Response body.
+    # @param retry_after_header Value of the Retry-After header.
+    # @return The exception to raise, or nil if the body is not a demo error.
+    def build_demo_exception(status_code, body, retry_after_header)
+      return nil if body.nil? || body.empty?
+
+      begin
+        json = JSON.parse(body)
+      rescue JSON::ParserError
+        return nil
+      end
+      return nil unless json.is_a?(Hash)
+
+      error = json_string(json, 'error')
+      return nil if error.nil? || error.empty?
+
+      reason = json_string(json, 'reason')
+      field = json_string(json, 'field')
+      upgrade = json_string(json, 'upgrade')
+
+      retry_after = 0
+      retry_after = retry_after_header.strip.to_i if retry_after_header.to_s.strip =~ /\A\d+\z/
+
+      case error
+      when 'rate_limited'
+        DemoRateLimitException.new(status_code, reason, retry_after, upgrade, body)
+      when 'unsafe_url'
+        DemoSafetyException.new(status_code, field, reason, body)
+      when 'unsupported_in_demo'
+        DemoUnsupportedException.new(status_code, field, upgrade, body)
+      when 'body_too_large'
+        message = "(#{status_code}) Demo request body exceeds the demo cap. Upgrade at #{upgrade || DEMO_UPGRADE_URL}."
+        ApiException.new(message)
+      end
+    end
+    private :build_demo_exception
+
+    # Get a top-level JSON field as string.
+    def json_string(json, field)
+      value = json[field]
+      value.nil? ? nil : value.to_s
+    end
+    private :json_string
 
     # Encode data for multipart POST
     def encode_multipart_form_data
-      data = []
+      data = String.new # binary (ASCII-8BIT) buffer
 
       # encode regular parameters
       @parameters.each do |key, value|
-        data << '--' + MULTIPART_FORM_DATA_BOUNDARY << 'Content-Disposition: form-data; name="%s"' % key << '' << value.to_s if value
+        next if value.nil?
+
+        data << "--#{MULTIPART_FORM_DATA_BOUNDARY}#{NEW_LINE}".b
+        data << "Content-Disposition: form-data; name=\"#{key}\"#{NEW_LINE}".b
+        data << NEW_LINE.b
+        data << value.to_s.b
+        data << NEW_LINE.b
       end
 
       # encode files
       @files.each do |key, value|
-        File.open(value, 'rb') do |f|
-          data << '--' + MULTIPART_FORM_DATA_BOUNDARY
-          data << 'Content-Disposition: form-data; name="%s"; filename="%s"' % [key, value]
-          data << 'Content-Type: application/octet-stream'
-          data << ''
-          data << f.read.force_encoding('UTF-8')
-        end
+        data << "--#{MULTIPART_FORM_DATA_BOUNDARY}#{NEW_LINE}".b
+        data << "Content-Disposition: form-data; name=\"#{key}\"; filename=\"#{value}\"#{NEW_LINE}".b
+        data << "Content-Type: application/octet-stream#{NEW_LINE}".b
+        data << NEW_LINE.b
+        data << File.binread(value)
+        data << NEW_LINE.b
       end
 
       # encode additional binary data
       @binary_data.each do |key, value|
-        data << '--' + MULTIPART_FORM_DATA_BOUNDARY
-        data << 'Content-Disposition: form-data; name="%s"; filename="%s"' % [key, key]
-        data << 'Content-Type: application/octet-stream'
-        data << ''
-        data << value.force_encoding('UTF-8')
+        data << "--#{MULTIPART_FORM_DATA_BOUNDARY}#{NEW_LINE}".b
+        data << "Content-Disposition: form-data; name=\"#{key}\"; filename=\"#{key}\"#{NEW_LINE}".b
+        data << "Content-Type: application/octet-stream#{NEW_LINE}".b
+        data << NEW_LINE.b
+        data << value.to_s.b
+        data << NEW_LINE.b
       end
 
       # final boundary
-      data << '--' + MULTIPART_FORM_DATA_BOUNDARY + '--'
-      data << ''
+      data << "--#{MULTIPART_FORM_DATA_BOUNDARY}--#{NEW_LINE}".b
 
-      data.join(NEW_LINE)
+      data
     end
     private :encode_multipart_form_data
 
@@ -443,6 +671,18 @@ module SelectPdf
       @job_id
     end
     protected :start_async_job_multipart_form_data
+
+    # Copy the results of a finished asynchronous job (number of pages and response telemetry) into this client.
+    #
+    # @param async_job_client The async job client that retrieved the result.
+    def copy_async_job_results(async_job_client)
+      @number_of_pages = async_job_client.number_of_pages
+      @credits_total = async_job_client.credits_total unless async_job_client.credits_total.nil?
+      @credits_remaining = async_job_client.credits_remaining unless async_job_client.credits_remaining.nil?
+      @mode = async_job_client.mode unless async_job_client.mode.empty?
+      @execution_mode = async_job_client.execution_mode unless async_job_client.execution_mode.empty?
+    end
+    protected :copy_async_job_results
   end
 
   # Get usage details for SelectPdf Online API.
@@ -533,6 +773,9 @@ module SelectPdf
 
     # Blink rendering engine.
     BLINK = 'Blink'
+
+    # Chromium rendering engine.
+    CHROMIUM = 'Chromium'
   end
 
   # Protocol used for secure (HTTPS) connections.
@@ -622,6 +865,87 @@ module SelectPdf
     HTML = 1
   end
 
+  # PDF conformance target for the generated document.
+  # Tagged standards (PdfA3A) require the Blink or Chromium rendering engine.
+  # When no engine is specified the API promotes the request to Chromium and reports the engine used in the X-SelectPdf-Engine response header.
+  class PdfStandard
+    # The complete PDF feature set. Default.
+    FULL = 'Full'
+
+    # PDF/A - long term archiving.
+    PDF_A = 'PdfA'
+
+    # PDF/A-2B - long term archiving, transparencies allowed.
+    PDF_A2B = 'PdfA2B'
+
+    # PDF/A-3A - the accessible level of PDF/A-3. Implies a tagged document and can carry a ZUGFeRD / Factur-X electronic invoice.
+    PDF_A3A = 'PdfA3A'
+
+    # PDF/A-3B - long term archiving with arbitrary embedded files. Can carry a ZUGFeRD / Factur-X electronic invoice.
+    PDF_A3B = 'PdfA3B'
+
+    # PDF/A-3U - PDF/A-3B with Unicode mapping for all text. Can carry a ZUGFeRD / Factur-X electronic invoice.
+    PDF_A3U = 'PdfA3U'
+
+    # PDF/X - graphics exchange.
+    PDF_X = 'PdfX'
+
+    # PDF/SiqQ Level A - suitable for digital signatures, external links disabled.
+    PDF_SIQQ_A = 'PdfSiqQ_A'
+
+    # PDF/SiqQ Level B - suitable for digital signatures.
+    PDF_SIQQ_B = 'PdfSiqQ_B'
+  end
+
+  # The data profile of a ZUGFeRD / Factur-X hybrid electronic invoice.
+  # The profile determines how much of the EN 16931 semantic model the embedded XML carries.
+  class ZugferdProfile
+    # MINIMUM - accounting information only. Not a complete invoice.
+    MINIMUM = 'Minimum'
+
+    # BASIC WL - header and footer data without invoice lines. Not a complete invoice.
+    BASIC_WL = 'Basic_WL'
+
+    # BASIC - a subset of EN 16931 covering simple invoices, with lines.
+    BASIC = 'Basic'
+
+    # EN 16931 (formerly COMFORT) - the full European semantic standard.
+    EN16931 = 'En16931'
+
+    # EXTENDED - EN 16931 plus additional business terms.
+    EXTENDED = 'Extended'
+
+    # XRECHNUNG - the German public-sector reference profile. The embedded file is named xrechnung.xml instead of factur-x.xml.
+    XRECHNUNG = 'XRechnung'
+  end
+
+  # How the embedded invoice XML relates to the visible invoice page.
+  # When not set, the API derives this from the profile: Alternative for Minimum and Basic_WL, Data for the rest.
+  # Minimum and Basic_WL combined with Data are rejected, because those profiles do not carry a complete invoice.
+  class ZugferdRelationship
+    # The XML and the visible page carry exactly the same invoice content.
+    # Mandatory in Germany for the Basic, En16931, Extended and XRechnung profiles.
+    DATA = 'Data'
+
+    # The visible page carries more than the XML does - always the case for the Minimum and Basic_WL profiles - or the page was generated from the XML.
+    ALTERNATIVE = 'Alternative'
+
+    # The XML is the source the visible page was produced from.
+    SOURCE = 'Source'
+
+    # The XML supplements the visible page.
+    SUPPLEMENT = 'Supplement'
+  end
+
+  # The metadata schema used to identify a hybrid invoice inside the PDF.
+  class ZugferdSchema
+    # Factur-X 1.0 / ZUGFeRD 2.x - the current schema. Default.
+    FACTUR_X_10 = 'FacturX10'
+
+    # ZUGFeRD 2.0 - the legacy schema, deprecated but still accepted. Use only for recipients that explicitly require it.
+    ZUGFERD_20 = 'Zugferd20'
+  end
+
   # Html To Pdf Conversion with SelectPdf Online API.
   #
   # Code sample:
@@ -647,18 +971,18 @@ module SelectPdf
   #    client.rendering_engine = SelectPdf::RenderingEngine::WEBKIT # rendering engine
   #    client.conversion_delay = 1 # conversion delay
   #    client.navigation_timeout = 30 # navigation timeout
-  #    client.page_numbers = FALSE # page numbers
-  #    client.page_breaks_enhanced_algorithm = TRUE # enhanced page break algorithm
+  #    client.page_numbers = false # page numbers
+  #    client.page_breaks_enhanced_algorithm = true # enhanced page break algorithm
   #  
   #    # additional properties
   #  
-  #    # client.use_css_print = TRUE # enable CSS media print
-  #    # client.disable_javascript = TRUE # disable javascript
-  #    # client.disable_internal_links = TRUE # disable internal links
-  #    # client.disable_external_links = TRUE # disable external links
-  #    # client.keep_images_together = TRUE # keep images together
-  #    # client.scale_images = TRUE # scale images to create smaller pdfs
-  #    # client.single_page_pdf = TRUE # generate a single page PDF
+  #    # client.use_css_print = true # enable CSS media print
+  #    # client.disable_javascript = true # disable javascript
+  #    # client.disable_internal_links = true # disable internal links
+  #    # client.disable_external_links = true # disable external links
+  #    # client.keep_images_together = true # keep images together
+  #    # client.scale_images = true # scale images to create smaller pdfs
+  #    # client.single_page_pdf = true # generate a single page PDF
   #    # client.user_password = 'password' # secure the PDF with a password
   #  
   #    # generate automatic bookmarks
@@ -684,21 +1008,98 @@ module SelectPdf
   #  
   #    # get API usage
   #    usage_client = SelectPdf::UsageClient.new(api_key)
-  #    usage = usage_client.get_usage(FALSE)
+  #    usage = usage_client.get_usage(false)
   #    print("Usage: #{usage}\n")
   #    print('Conversions remained this month: ', usage['available'], "\n")
   #  rescue SelectPdf::ApiException => e
   #    print("An error occurred: #{e}")
   #  end
   class HtmlToPdfClient < ApiClient
+    # Names of the parameters the demo endpoint clamped on the most recent conversion (e.g. ["max_load_time", "engine"]),
+    # parsed from the X-SelectPdf-Demo-Clamped response header.
+    # Empty array if nothing was clamped or for non-demo responses. "Clamped" means the value was modified (capped, force-set), not discarded.
+    attr_reader :clamped_fields
+
+    # Names of the parameters the demo endpoint silently dropped on the most recent conversion (e.g. ["auth_username", "cookies"]),
+    # parsed from the X-SelectPdf-Demo-Dropped response header.
+    # The demo endpoint refuses to honor a small set of fields for safety reasons - auth credentials, cookies, raw_parameters, pdf_name, async.
+    # Empty array if nothing was dropped or for non-demo responses. Clamped = value modified, dropped = value thrown away.
+    attr_reader :dropped_fields
+
     # Construct the Html To Pdf Client.
     #
-    # @param api_key API Key.
-    def initialize(api_key)
+    # Pass a paid API key for production use. Pass nil, empty string, or "demo" (case-insensitive) to use the keyless demo endpoint -
+    # output is watermarked and capped at 5 pages, but no signup is required.
+    #
+    # @param api_key API Key. Defaults to nil, which selects demo mode. Pass a real key for full unwatermarked output.
+    def initialize(api_key = nil)
       super()
-      @api_endpoint = 'https://selectpdf.com/api2/convert/'
-      @parameters['key'] = api_key
+
+      @clamped_fields = []
+      @dropped_fields = []
+
+      @demo_mode = api_key.nil? || api_key.empty? || api_key.strip.casecmp('demo').zero?
+
+      if @demo_mode
+        # Demo is keyless - the key parameter is not sent.
+        @api_endpoint = 'https://selectpdf.com/api2/convert/demo/'
+      else
+        @api_endpoint = 'https://selectpdf.com/api2/convert/'
+        @parameters['key'] = api_key
+      end
     end
+
+    # True if the client was constructed for the keyless demo endpoint (api_key was nil, empty, or "demo").
+    # Set at construction time and stable for the lifetime of the client. Changing api_endpoint does NOT change this flag.
+    #
+    # @return True if the client is in demo mode.
+    def demo_mode?
+      @demo_mode
+    end
+
+    # True if the most recent response was tagged X-SelectPdf-Mode: demo (i.e. the request actually landed on a demo endpoint).
+    #
+    # @return True if the last response came from the demo endpoint.
+    def demo_response?
+      !@mode.nil? && @mode.casecmp('demo').zero?
+    end
+
+    # True if the most recent response had any clamped fields.
+    #
+    # @return True if any field was clamped.
+    def was_clamped?
+      !@clamped_fields.nil? && !@clamped_fields.empty?
+    end
+
+    # True if the most recent response reported any dropped fields.
+    #
+    # @return True if any field was dropped.
+    def was_any_field_dropped?
+      !@dropped_fields.nil? && !@dropped_fields.empty?
+    end
+
+    # Capture demo-specific response headers (the demo-clamped fields list and the demo-dropped fields list).
+    #
+    # @param response HTTP response.
+    def on_response_headers_received(response)
+      @clamped_fields = split_fields(response['X-SelectPdf-Demo-Clamped'])
+      @dropped_fields = split_fields(response['X-SelectPdf-Demo-Dropped'])
+    end
+    protected :on_response_headers_received
+
+    # Split a comma separated header value.
+    def split_fields(raw)
+      return [] if raw.nil? || raw.empty?
+
+      raw.split(',', -1).map(&:strip)
+    end
+    private :split_fields
+
+    # Raise DemoUnsupportedException for asynchronous calls in demo mode (the demo endpoint is synchronous only).
+    def ensure_async_supported
+      raise DemoUnsupportedException.new(0, 'async') if @demo_mode
+    end
+    private :ensure_async_supported
 
     # Convert the specified url to PDF.
     # SelectPdf online API can convert http:// and https:// publicly available urls.
@@ -778,7 +1179,10 @@ module SelectPdf
     #
     # @param url Address of the web page being converted.
     # @return The resulted pdf.
+    # Raises DemoUnsupportedException in demo mode (the demo endpoint does not run asynchronous jobs).
     def convert_url_async(url)
+      ensure_async_supported
+
       if !url.downcase.start_with?('http://') && !url.downcase.start_with?('https://')
         raise ApiException.new('The supported protocols for the converted webpage are http:// and https://.'), 'The supported protocols for the converted webpage are http:// and https://.'
       end
@@ -812,7 +1216,7 @@ module SelectPdf
 
         next if result.nil?
 
-        @number_of_pages = async_job_client.number_of_pages
+        copy_async_job_results(async_job_client)
         return result
       end
 
@@ -896,7 +1300,10 @@ module SelectPdf
     #
     # @param html_string HTML string with the content being converted.
     # @param base_url Base url used to resolve relative paths to resources (css, images, javascript, etc). Must be a http:// or https:// publicly available url.
+    # Raises DemoUnsupportedException in demo mode (the demo endpoint does not run asynchronous jobs).
     def convert_html_string_with_base_url_async(html_string, base_url)
+      ensure_async_supported
+
       @parameters.delete('url')
       @parameters['html'] = html_string
       @parameters['base_url'] = base_url unless base_url.nil? || base_url.empty?
@@ -922,7 +1329,7 @@ module SelectPdf
 
         next if result.nil?
 
-        @number_of_pages = async_job_client.number_of_pages
+        copy_async_job_results(async_job_client)
         return result
       end
 
@@ -1086,26 +1493,68 @@ module SelectPdf
 
     # Set the rendering engine used for the HTML to PDF conversion. Default value is WebKit.
     #
-    # @param rendering_engine HTML rendering engine. Use constants from SelectPdf::RenderingEngine class.
+    # @param rendering_engine HTML rendering engine. Possible values: WebKit, Restricted, Blink, Chromium. Use constants from SelectPdf::RenderingEngine class.
     def rendering_engine=(rendering_engine)
-      unless /(?i)^(WebKit|Restricted|Blink)$/.match(rendering_engine)
-        raise ApiException.new('Allowed values for Rendering Engine: WebKit, Restricted, Blink.'), 'Allowed values for Rendering Engine: WebKit, Restricted, Blink.'
+      unless /(?i)^(WebKit|Restricted|Blink|Chromium)$/.match(rendering_engine)
+        raise ApiException.new('Allowed values for Rendering Engine: WebKit, Restricted, Blink, Chromium.'), 'Allowed values for Rendering Engine: WebKit, Restricted, Blink, Chromium.'
       end
 
       @parameters['engine'] = rendering_engine
     end
 
+    # Produce a tagged, accessible PDF: a logical structure tree covering headings, paragraphs, lists, tables,
+    # figures with alternate text, links and reading order. The default value is False.
+    #
+    # Requires the Blink or Chromium rendering engine - the WebKit engines cannot produce a structure tree.
+    # If no engine is set, the API promotes the request to Chromium and reports it in the X-SelectPdf-Engine response header.
+    # Setting an explicit WebKit engine together with tagged output is rejected by the API.
+    # A tagged document also needs a title, so set doc_title - the converter falls back to the HTML document title when it is not set.
+    #
+    # @param tagged Produce a tagged, accessible PDF or not.
+    def tagged=(tagged)
+      @parameters['tagged'] = tagged
+    end
+
+    # Set the PDF conformance target - PDF/A for archiving, PDF/X for graphics exchange, PDF/SiqQ for digital signatures. The default value is Full.
+    #
+    # PdfA3A is the accessible level of PDF/A-3: it implies a tagged document, so it carries the same rendering-engine requirement as tagged.
+    #
+    # @param pdf_standard PDF conformance target. Possible values: Full, PdfA, PdfA2B, PdfA3A, PdfA3B, PdfA3U, PdfX, PdfSiqQ_A, PdfSiqQ_B.
+    # Use constants from SelectPdf::PdfStandard class.
+    def pdf_standard=(pdf_standard)
+      unless /(?i)^(Full|PdfA|PdfA2B|PdfA3A|PdfA3B|PdfA3U|PdfX|PdfSiqQ_A|PdfSiqQ_B)$/.match(pdf_standard)
+        raise ApiException.new('Allowed values for Pdf Standard: Full, PdfA, PdfA2B, PdfA3A, PdfA3B, PdfA3U, PdfX, PdfSiqQ_A, PdfSiqQ_B.'),
+              'Allowed values for Pdf Standard: Full, PdfA, PdfA2B, PdfA3A, PdfA3B, PdfA3U, PdfX, PdfSiqQ_A, PdfSiqQ_B.'
+      end
+
+      @parameters['pdf_standard'] = pdf_standard
+    end
+
+    # Set the natural language of the document, for example "en-US" or "de-DE".
+    # Written as the PDF /Lang entry and onto tagged structure elements. The default value is "en-US".
+    #
+    # @param doc_language Language tag, for example "en-US".
+    def doc_language=(doc_language)
+      @parameters['doc_language'] = doc_language
+    end
+
     # Set PDF user password.
+    # Not available in demo mode: raises DemoUnsupportedException if the client was constructed without an API key.
     #
     # @param user_password PDF user password.
     def user_password=(user_password)
+      raise DemoUnsupportedException.new(0, 'user_password') if @demo_mode && !(user_password.nil? || user_password.empty?)
+
       @parameters['user_password'] = user_password
     end
 
     # Set PDF owner password.
+    # Not available in demo mode: raises DemoUnsupportedException if the client was constructed without an API key.
     #
     # @param owner_password PDF owner password.
     def owner_password=(owner_password)
+      raise DemoUnsupportedException.new(0, 'owner_password') if @demo_mode && !(owner_password.nil? || owner_password.empty?)
+
       @parameters['owner_password'] = owner_password
     end
 
@@ -1122,6 +1571,17 @@ module SelectPdf
     # @param web_page_height Browser window height in pixels. Set it to 0px to automatically calculate page height.
     def web_page_height=(web_page_height)
       @parameters['web_page_height'] = web_page_height
+    end
+
+    # Leave out the content below the web page height (set with web_page_height) instead of letting the page flow onto further pages.
+    #
+    # When not set, each rendering engine keeps its own behavior: WebKit and WebKit Restricted leave the content out whenever a web page height is set,
+    # Blink and Chromium convert the whole page. Set it to True or False to choose explicitly. It needs a non-zero web page height; with 0 there is no
+    # height to fix the page at and the setting is ignored. With WebKit, a fixed size also cuts off content wider than the web page width.
+    #
+    # @param web_page_fixed_size True to cut the page at the web page height, False to convert the whole page.
+    def web_page_fixed_size=(web_page_fixed_size)
+      @parameters['web_page_fixed_size'] = web_page_fixed_size
     end
 
     # Introduce a delay (in seconds) before the actual conversion to allow the web page to fully load. This property is an alias for conversion_delay.
@@ -1667,10 +2127,39 @@ module SelectPdf
     end
 
     # Set HTTP cookies for the web page being converted.
+    # The demo endpoint does not send cookies; it reports the value in dropped_fields.
     #
-    # @param cookies HTTP cookies that will be sent to the page being converted.
+    # @param cookies HTTP cookies that will be sent to the page being converted (a Hash of cookie names and values).
     def cookies=(cookies)
-      @parameters['cookies_string'] = URI.encode_www_form(cookies)
+      # Serialized as name=value&name=value&..., each part percent-encoded (spaces as %20, not +), the same way the .NET client sends it.
+      serialized = ''.dup
+      cookies.each do |name, value|
+        serialized << "#{encode_cookie_part(name)}=#{encode_cookie_part(value)}&"
+      end
+
+      @parameters['cookies_string'] = serialized
+    end
+
+    # Percent-encode a cookie name or value.
+    def encode_cookie_part(part)
+      URI.encode_www_form_component(part.to_s).gsub('+', '%20')
+    end
+    private :encode_cookie_part
+
+    # Set the user name for HTTP Basic authentication on the web page being converted.
+    # Use it together with auth_password. The demo endpoint does not send credentials; it reports the value in dropped_fields.
+    #
+    # @param auth_username User name for HTTP Basic authentication.
+    def auth_username=(auth_username)
+      @parameters['auth_username'] = auth_username
+    end
+
+    # Set the password for HTTP Basic authentication on the web page being converted.
+    # Use it together with auth_username. The demo endpoint does not send credentials; it reports the value in dropped_fields.
+    #
+    # @param auth_password Password for HTTP Basic authentication.
+    def auth_password=(auth_password)
+      @parameters['auth_password'] = auth_password
     end
 
     # Set a custom parameter. Do not use this method unless advised by SelectPdf.
@@ -1690,6 +2179,380 @@ module SelectPdf
 
       web_elements_client.web_elements
     end
+  end
+
+  # Create ZUGFeRD / Factur-X hybrid electronic invoices with SelectPdf Online API.
+  #
+  # A hybrid electronic invoice is one PDF/A-3 file carrying both halves of the invoice: the page a human reads,
+  # and the XML a recipient's accounting system reads. This client converts a URL or an HTML string into the visible invoice
+  # and embeds the XML into it as an associated file, with the metadata invoice software looks for.
+  #
+  # It derives from HtmlToPdfClient, so every conversion setting - page size, margins, headers, footers, rendering engine - applies here too.
+  # Use the create_from_* methods rather than the inherited convert_* methods: the invoice endpoint takes a multipart request,
+  # because the XML is uploaded as a file part.
+  #
+  # The carrier document must be PDF/A-3. The default is SelectPdf::PdfStandard::PDF_A3A, the accessible level, which the standards recommend
+  # because it makes the visible invoice readable by assistive technology as well as archivable. Because PdfA3A is a tagged standard,
+  # a request that does not set a rendering engine is promoted to Chromium by the API, which reports the engine used in the X-SelectPdf-Engine response header.
+  #
+  # There is no way to attach an invoice XML to an existing PDF you already have: the XML can only be embedded into a document created as PDF/A-3.
+  #
+  # Code sample:
+  #
+  #  require 'selectpdf'
+  #
+  #  api_key = 'Your API key here'
+  #  invoice_html = '<html><body><h1>Invoice INV-2026-001</h1></body></html>'
+  #  invoice_xml = 'factur-x.xml'
+  #  local_file = 'Invoice.pdf'
+  #
+  #  begin
+  #    client = SelectPdf::InvoiceClient.new(api_key)
+  #
+  #    client.invoice_xml_file = invoice_xml
+  #    client.zugferd_profile = SelectPdf::ZugferdProfile::EN16931
+  #    client.doc_title = 'Invoice INV-2026-001'
+  #
+  #    client.create_from_html_string_to_file(invoice_html, local_file)
+  #
+  #    print "Finished! Number of pages: #{client.number_of_pages}.\n"
+  #  rescue SelectPdf::ApiException => e
+  #    print("An error occurred: #{e}")
+  #  end
+  class InvoiceClient < HtmlToPdfClient
+    # The production endpoint for hybrid electronic invoices.
+    INVOICE_ENDPOINT = 'https://selectpdf.com/api2/invoice/'
+
+    # Construct the Invoice Client.
+    #
+    # Unlike HtmlToPdfClient, this client has no demo mode - the keyless demo endpoint does not produce electronic invoices - so an API key is required.
+    # Raises ApiException when no API key is supplied.
+    #
+    # @param api_key API Key.
+    def initialize(api_key)
+      if api_key.nil? || api_key.empty? || api_key.strip.downcase == 'demo'
+        raise ApiException.new('An API key is required to create electronic invoices. The keyless demo endpoint does not support them.'),
+              'An API key is required to create electronic invoices. The keyless demo endpoint does not support them.'
+      end
+
+      super(api_key)
+
+      @api_endpoint = INVOICE_ENDPOINT
+
+      # The carrier has to be PDF/A-3; default to the accessible level, which the standards recommend. Overridable with pdf_standard.
+      @parameters['pdf_standard'] = PdfStandard::PDF_A3A
+    end
+
+    # Set the invoice XML from a local file.
+    #
+    # Only the content of the file is used - the name recorded inside the PDF is the one the standard prescribes
+    # ("factur-x.xml", or "xrechnung.xml" for the XRECHNUNG profile), because recipients look it up by name.
+    #
+    # @param invoice_xml_file Path to the local invoice XML file.
+    def invoice_xml_file=(invoice_xml_file)
+      @binary_data.delete('zugferd_xml')
+      @files['zugferd_xml'] = invoice_xml_file
+    end
+
+    # Set the invoice XML from memory.
+    #
+    # @param invoice_xml The invoice XML, as a string or as raw bytes (a binary string). Text strings are sent UTF-8 encoded.
+    def invoice_xml=(invoice_xml)
+      data = invoice_xml.to_s
+      data = data.encode('UTF-8') unless data.encoding == Encoding::BINARY || data.encoding == Encoding::UTF_8
+
+      @files.delete('zugferd_xml')
+      @binary_data['zugferd_xml'] = data.b
+    end
+
+    # Set the data profile of the invoice XML. Required.
+    #
+    # @param zugferd_profile The invoice data profile. Possible values: Minimum, Basic_WL, Basic, En16931, Extended, XRechnung.
+    # Use constants from SelectPdf::ZugferdProfile class.
+    def zugferd_profile=(zugferd_profile)
+      unless /(?i)^(Minimum|Basic_WL|Basic|En16931|Extended|XRechnung)$/.match(zugferd_profile)
+        raise ApiException.new('Allowed values for Zugferd Profile: Minimum, Basic_WL, Basic, En16931, Extended, XRechnung.'),
+              'Allowed values for Zugferd Profile: Minimum, Basic_WL, Basic, En16931, Extended, XRechnung.'
+      end
+
+      @parameters['zugferd_profile'] = zugferd_profile
+    end
+
+    # Set how the embedded XML relates to the visible invoice page.
+    #
+    # Optional. When not set, the API derives it from the profile: Alternative for Minimum and Basic_WL, which do not carry a complete invoice,
+    # and Data for the rest. Those two profiles combined with Data are rejected by the API.
+    #
+    # @param zugferd_relationship The relationship between XML and page. Possible values: Data, Alternative, Source, Supplement.
+    # Use constants from SelectPdf::ZugferdRelationship class.
+    def zugferd_relationship=(zugferd_relationship)
+      unless /(?i)^(Data|Alternative|Source|Supplement)$/.match(zugferd_relationship)
+        raise ApiException.new('Allowed values for Zugferd Relationship: Data, Alternative, Source, Supplement.'),
+              'Allowed values for Zugferd Relationship: Data, Alternative, Source, Supplement.'
+      end
+
+      @parameters['zugferd_relationship'] = zugferd_relationship
+    end
+
+    # Set the metadata schema identifying the invoice. The default value is FacturX10.
+    #
+    # @param zugferd_schema The invoice metadata schema. Possible values: FacturX10, Zugferd20. Use constants from SelectPdf::ZugferdSchema class.
+    def zugferd_schema=(zugferd_schema)
+      unless /(?i)^(FacturX10|Zugferd20)$/.match(zugferd_schema)
+        raise ApiException.new('Allowed values for Zugferd Schema: FacturX10, Zugferd20.'), 'Allowed values for Zugferd Schema: FacturX10, Zugferd20.'
+      end
+
+      @parameters['zugferd_schema'] = zugferd_schema
+    end
+
+    # Create a hybrid electronic invoice from the invoice page at the specified url.
+    #
+    # @param url Url of the invoice page.
+    # @return The resulted hybrid invoice PDF.
+    def create_from_url(url)
+      prepare_invoice_url(url)
+      @parameters['async'] = 'False'
+
+      perform_post_as_multipart_formdata
+    end
+
+    # Create a hybrid electronic invoice from the invoice page at the specified url and write it to an output stream.
+    #
+    # @param url Url of the invoice page.
+    # @param stream The output stream where the resulted PDF will be written.
+    def create_from_url_to_stream(url, stream)
+      prepare_invoice_url(url)
+      @parameters['async'] = 'False'
+
+      perform_post_as_multipart_formdata(stream)
+    end
+
+    # Create a hybrid electronic invoice from the invoice page at the specified url and write it to a local file.
+    #
+    # @param url Url of the invoice page.
+    # @param file_path Local file including path if necessary.
+    def create_from_url_to_file(url, file_path)
+      write_invoice_to_file(file_path) do |file|
+        create_from_url_to_stream(url, file)
+      end
+    end
+
+    # Create a hybrid electronic invoice from a raw HTML string.
+    #
+    # @param html_string The invoice HTML.
+    # @return The resulted hybrid invoice PDF.
+    def create_from_html_string(html_string)
+      create_from_html_string_with_base_url(html_string, nil)
+    end
+
+    # Create a hybrid electronic invoice from a raw HTML string. Use a base url to resolve relative paths to resources.
+    #
+    # @param html_string The invoice HTML.
+    # @param base_url Base url used to resolve relative paths to resources (css, images, javascript, etc). Must be a http:// or https:// publicly available url.
+    # @return The resulted hybrid invoice PDF.
+    def create_from_html_string_with_base_url(html_string, base_url)
+      prepare_invoice_html(html_string, base_url)
+      @parameters['async'] = 'False'
+
+      perform_post_as_multipart_formdata
+    end
+
+    # Create a hybrid electronic invoice from a raw HTML string and write it to an output stream.
+    #
+    # @param html_string The invoice HTML.
+    # @param stream The output stream where the resulted PDF will be written.
+    def create_from_html_string_to_stream(html_string, stream)
+      create_from_html_string_to_stream_with_base_url(html_string, nil, stream)
+    end
+
+    # Create a hybrid electronic invoice from a raw HTML string and write it to an output stream. Use a base url to resolve relative paths to resources.
+    #
+    # @param html_string The invoice HTML.
+    # @param base_url Base url used to resolve relative paths to resources (css, images, javascript, etc). Must be a http:// or https:// publicly available url.
+    # @param stream The output stream where the resulted PDF will be written.
+    def create_from_html_string_to_stream_with_base_url(html_string, base_url, stream)
+      prepare_invoice_html(html_string, base_url)
+      @parameters['async'] = 'False'
+
+      perform_post_as_multipart_formdata(stream)
+    end
+
+    # Create a hybrid electronic invoice from a raw HTML string and write it to a local file.
+    #
+    # @param html_string The invoice HTML.
+    # @param file_path Local file including path if necessary.
+    def create_from_html_string_to_file(html_string, file_path)
+      create_from_html_string_with_base_url_to_file(html_string, nil, file_path)
+    end
+
+    # Create a hybrid electronic invoice from a raw HTML string and write it to a local file. Use a base url to resolve relative paths to resources.
+    #
+    # @param html_string The invoice HTML.
+    # @param base_url Base url used to resolve relative paths to resources (css, images, javascript, etc). Must be a http:// or https:// publicly available url.
+    # @param file_path Local file including path if necessary.
+    def create_from_html_string_with_base_url_to_file(html_string, base_url, file_path)
+      write_invoice_to_file(file_path) do |file|
+        create_from_html_string_to_stream_with_base_url(html_string, base_url, file)
+      end
+    end
+
+    # Create a hybrid electronic invoice from the invoice page at the specified url, using an asynchronous call.
+    # Recommended for long invoice pages or callers that cannot hold an HTTP connection open for the whole conversion.
+    #
+    # @param url Url of the invoice page.
+    # @return The resulted hybrid invoice PDF.
+    def create_from_url_async(url)
+      prepare_invoice_url(url)
+      run_invoice_async_job
+    end
+
+    # Create a hybrid electronic invoice from the invoice page at the specified url, using an asynchronous call, and write it to an output stream.
+    #
+    # @param url Url of the invoice page.
+    # @param stream The output stream where the resulted PDF will be written.
+    def create_from_url_to_stream_async(url, stream)
+      result = create_from_url_async(url)
+      stream.write(result)
+    end
+
+    # Create a hybrid electronic invoice from the invoice page at the specified url, using an asynchronous call, and write it to a local file.
+    #
+    # @param url Url of the invoice page.
+    # @param file_path Local file including path if necessary.
+    def create_from_url_to_file_async(url, file_path)
+      result = create_from_url_async(url)
+      File.open(file_path, 'wb') do |file|
+        file.write(result)
+      end
+    end
+
+    # Create a hybrid electronic invoice from a raw HTML string, using an asynchronous call.
+    #
+    # @param html_string The invoice HTML.
+    # @return The resulted hybrid invoice PDF.
+    def create_from_html_string_async(html_string)
+      create_from_html_string_with_base_url_async(html_string, nil)
+    end
+
+    # Create a hybrid electronic invoice from a raw HTML string, using an asynchronous call. Use a base url to resolve relative paths to resources.
+    #
+    # @param html_string The invoice HTML.
+    # @param base_url Base url used to resolve relative paths to resources (css, images, javascript, etc). Must be a http:// or https:// publicly available url.
+    # @return The resulted hybrid invoice PDF.
+    def create_from_html_string_with_base_url_async(html_string, base_url)
+      prepare_invoice_html(html_string, base_url)
+      run_invoice_async_job
+    end
+
+    # Create a hybrid electronic invoice from a raw HTML string, using an asynchronous call, and write it to an output stream.
+    #
+    # @param html_string The invoice HTML.
+    # @param stream The output stream where the resulted PDF will be written.
+    def create_from_html_string_to_stream_async(html_string, stream)
+      result = create_from_html_string_async(html_string)
+      stream.write(result)
+    end
+
+    # Create a hybrid electronic invoice from a raw HTML string, using an asynchronous call, and write it to a local file.
+    #
+    # @param html_string The invoice HTML.
+    # @param file_path Local file including path if necessary.
+    def create_from_html_string_to_file_async(html_string, file_path)
+      result = create_from_html_string_async(html_string)
+      File.open(file_path, 'wb') do |file|
+        file.write(result)
+      end
+    end
+
+    # Validate the url and set the url parameters.
+    def prepare_invoice_url(url)
+      if !url.downcase.start_with?('http://') && !url.downcase.start_with?('https://')
+        raise ApiException.new('The supported protocols for the converted webpage are http:// and https://.'), 'The supported protocols for the converted webpage are http:// and https://.'
+      end
+
+      if url.downcase.start_with?('http://localhost')
+        raise ApiException.new('Cannot convert local urls. SelectPdf online API can only convert publicly available urls.'), 'Cannot convert local urls. SelectPdf online API can only convert publicly available urls.'
+      end
+
+      require_invoice_xml
+
+      @parameters['url'] = url
+      @parameters.delete('html')
+      @parameters.delete('base_url')
+    end
+    private :prepare_invoice_url
+
+    # Set the html parameters.
+    def prepare_invoice_html(html_string, base_url)
+      require_invoice_xml
+
+      @parameters.delete('url')
+      @parameters['html'] = html_string
+
+      if base_url.nil? || base_url.empty?
+        @parameters.delete('base_url')
+      else
+        @parameters['base_url'] = base_url
+      end
+    end
+    private :prepare_invoice_html
+
+    # Fail here rather than spending a round trip on a request the API will reject with the same message.
+    def require_invoice_xml
+      unless @files.key?('zugferd_xml') || @binary_data.key?('zugferd_xml')
+        raise ApiException.new('The invoice XML was not specified. Set invoice_xml_file or invoice_xml before creating the invoice.'),
+              'The invoice XML was not specified. Set invoice_xml_file or invoice_xml before creating the invoice.'
+      end
+
+      profile = @parameters['zugferd_profile']
+      if profile.nil? || profile.to_s.empty?
+        raise ApiException.new('The invoice profile was not specified. Set zugferd_profile before creating the invoice.'),
+              'The invoice profile was not specified. Set zugferd_profile before creating the invoice.'
+      end
+    end
+    private :require_invoice_xml
+
+    # Run the invoice request as an asynchronous job and wait for its result.
+    def run_invoice_async_job
+      job_id = start_async_job_multipart_form_data
+
+      if job_id.nil? || job_id.empty?
+        raise ApiException.new('An error occurred launching the asynchronous call.'), 'An error occurred launching the asynchronous call.'
+      end
+
+      no_pings = 0
+
+      while no_pings < @async_calls_max_pings
+        no_pings += 1
+
+        # sleep for a few seconds before next ping
+        sleep(@async_calls_ping_interval)
+
+        async_job_client = AsyncJobClient.new(@parameters['key'], job_id)
+        async_job_client.api_endpoint = @api_async_endpoint
+
+        result = async_job_client.result
+
+        next unless async_job_client.finished?
+
+        copy_async_job_results(async_job_client)
+        return result
+      end
+
+      raise ApiException.new('Asynchronous call did not finish in expected timeframe.'), 'Asynchronous call did not finish in expected timeframe.'
+    end
+    private :run_invoice_async_job
+
+    # Write the result of a conversion to a local file. The file is deleted if the conversion fails.
+    def write_invoice_to_file(file_path)
+      File.open(file_path, 'wb') do |file|
+        yield file
+      end
+    rescue ApiException
+      FileUtils.rm(file_path) if File.exist?(file_path)
+      raise
+    end
+    private :write_invoice_to_file
   end
 
   # Get the locations of certain web elements.
@@ -1739,9 +2602,19 @@ module SelectPdf
     def result
       result = perform_post
 
-      return result if @job_id.nil? || @job_id.empty?
+      # 202 Accepted - the job is still running
+      return nil unless finished?
 
-      return nil
+      result
+    end
+
+    # Check if the asynchronous job is finished.
+    # 200 OK means the job finished successfully, 202 Accepted means the job is still running.
+    # Any other status code raises an ApiException from result (the job finished with an error).
+    #
+    # @return True if the job finished.
+    def finished?
+      @last_http_code != 202
     end
   end
 
@@ -1783,7 +2656,7 @@ module SelectPdf
   #  
   #    # get API usage
   #    usage_client = SelectPdf::UsageClient.new(api_key)
-  #    usage = usage_client.get_usage(FALSE)
+  #    usage = usage_client.get_usage(false)
   #    print("Usage: #{usage}\n")
   #    print('Conversions remained this month: ', usage['available'], "\n")
   #  rescue SelectPdf::ApiException => e
@@ -1898,7 +2771,7 @@ module SelectPdf
 
         next if result.nil?
 
-        @number_of_pages = async_job_client.number_of_pages
+        copy_async_job_results(async_job_client)
         @file_idx = 0
         @files = {}
 
@@ -2108,7 +2981,7 @@ module SelectPdf
   #
   #    # get API usage
   #    usage_client = SelectPdf::UsageClient.new(api_key)
-  #    usage = usage_client.get_usage(FALSE)
+  #    usage = usage_client.get_usage(false)
   #    print("Usage: #{usage}\n")
   #    print('Conversions remained this month: ', usage['available'], "\n")
   #  rescue SelectPdf::ApiException => e
@@ -2149,7 +3022,7 @@ module SelectPdf
   #    
   #      # get API usage
   #      usage_client = SelectPdf::UsageClient.new(api_key)
-  #      usage = usage_client.get_usage(FALSE)
+  #      usage = usage_client.get_usage(false)
   #      print("Usage: #{usage}\n")
   #      print('Conversions remained this month: ', usage['available'], "\n")
   #    rescue SelectPdf::ApiException => e
@@ -2238,7 +3111,7 @@ module SelectPdf
 
         next if result.nil?
 
-        @number_of_pages = async_job_client.number_of_pages
+        copy_async_job_results(async_job_client)
 
         return result
       end
@@ -2357,7 +3230,7 @@ module SelectPdf
 
         next if result.nil?
 
-        @number_of_pages = async_job_client.number_of_pages
+        copy_async_job_results(async_job_client)
 
         return result
       end
@@ -2397,7 +3270,7 @@ module SelectPdf
     # @param case_sensitive If the search is case sensitive or not.
     # @param whole_words_only If the search works on whole words or not.
     # @return List with text positions in the current PDF document.
-    def search_file(input_pdf, text_to_search, case_sensitive = FALSE, whole_words_only = FALSE)
+    def search_file(input_pdf, text_to_search, case_sensitive = false, whole_words_only = false)
       if text_to_search.nil? || text_to_search.empty?
         raise ApiException.new('Search text cannot be empty.'), 'Search text cannot be empty.'
       end
@@ -2428,7 +3301,7 @@ module SelectPdf
     # @param case_sensitive If the search is case sensitive or not.
     # @param whole_words_only If the search works on whole words or not.
     # @return List with text positions in the current PDF document.
-    def search_file_async(input_pdf, text_to_search, case_sensitive = FALSE, whole_words_only = FALSE)
+    def search_file_async(input_pdf, text_to_search, case_sensitive = false, whole_words_only = false)
       if text_to_search.nil? || text_to_search.empty?
         raise ApiException.new('Search text cannot be empty.'), 'Search text cannot be empty.'
       end
@@ -2466,7 +3339,7 @@ module SelectPdf
 
         next if result.nil?
 
-        @number_of_pages = async_job_client.number_of_pages
+        copy_async_job_results(async_job_client)
         return [] if result.empty?
 
         return JSON.parse(result)
@@ -2484,7 +3357,7 @@ module SelectPdf
     # @param case_sensitive If the search is case sensitive or not.
     # @param whole_words_only If the search works on whole words or not.
     # @return List with text positions in the current PDF document.
-    def search_url(url, text_to_search, case_sensitive = FALSE, whole_words_only = FALSE)
+    def search_url(url, text_to_search, case_sensitive = false, whole_words_only = false)
       if text_to_search.nil? || text_to_search.empty?
         raise ApiException.new('Search text cannot be empty.'), 'Search text cannot be empty.'
       end
@@ -2514,7 +3387,7 @@ module SelectPdf
     # @param case_sensitive If the search is case sensitive or not.
     # @param whole_words_only If the search works on whole words or not.
     # @return List with text positions in the current PDF document.
-    def search_url_async(url, text_to_search, case_sensitive = FALSE, whole_words_only = FALSE)
+    def search_url_async(url, text_to_search, case_sensitive = false, whole_words_only = false)
       if text_to_search.nil? || text_to_search.empty?
         raise ApiException.new('Search text cannot be empty.'), 'Search text cannot be empty.'
       end
@@ -2551,7 +3424,7 @@ module SelectPdf
 
         next if result.nil?
 
-        @number_of_pages = async_job_client.number_of_pages
+        copy_async_job_results(async_job_client)
         return [] if result.empty?
 
         return JSON.parse(result)
